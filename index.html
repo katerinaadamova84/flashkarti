@@ -1,0 +1,480 @@
+<html lang="bg"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Флаш Карти - История на България</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --gold: #c9973a;
+  --gold-dim: rgba(201,151,58,0.35);
+  --dark: #110d05;
+  --parchment: #f5ead6;
+  --red: #8b1a1a;
+  --red-soft: #e07070;
+}
+body {
+  min-height: 100vh;
+  background: var(--dark);
+  background-image:
+    radial-gradient(ellipse 80% 60% at 15% 40%, rgba(139,26,26,0.18) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 50% at 85% 15%, rgba(201,151,58,0.12) 0%, transparent 60%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-family: Georgia, serif;
+  color: var(--parchment);
+  padding: 24px 16px;
+}
+header { text-align: center; margin-bottom: 32px; }
+header h1 { font-size: clamp(1.3rem, 4vw, 2.2rem); font-weight: 700; color: var(--gold); letter-spacing: 0.08em; text-shadow: 0 0 40px rgba(201,151,58,0.5); }
+.subtitle { font-size: 0.95rem; color: rgba(245,234,214,0.45); margin-top: 6px; font-style: italic; }
+.divider { width: 120px; height: 1px; background: linear-gradient(90deg, transparent, var(--gold), transparent); margin: 12px auto 0; opacity: 0.5; }
+.progress-wrap { width: min(560px, 92vw); margin-bottom: 8px; }
+.progress-bar { height: 3px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, var(--red), var(--gold)); border-radius: 2px; transition: width 0.45s; }
+.counter { text-align: center; font-size: 0.7rem; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(245,234,214,0.35); margin: 8px 0 18px; }
+.scene { width: min(560px, 92vw); height: 300px; perspective: 1400px; cursor: pointer; margin-bottom: 26px; }
+.card { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; transition: transform 0.6s cubic-bezier(.4,0,.2,1); }
+.card.flipped { transform: rotateY(180deg); }
+.face { position: absolute; inset: 0; backface-visibility: hidden; -webkit-backface-visibility: hidden; border-radius: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 36px 40px 28px; text-align: center; box-shadow: 0 24px 64px rgba(0,0,0,0.7), 0 0 0 1px rgba(201,151,58,0.2), inset 0 1px 0 rgba(201,151,58,0.15); }
+.front { background: linear-gradient(160deg, #221508, #1a1007 60%, #120c04); }
+.back { transform: rotateY(180deg); background: linear-gradient(160deg, #1e0f0f, #1a1007 60%, #110c04); box-shadow: 0 24px 64px rgba(0,0,0,0.7), 0 0 0 1px rgba(224,112,112,0.2), inset 0 1px 0 rgba(224,112,112,0.1); }
+.face-label { font-size: 0.62rem; letter-spacing: 0.22em; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+.front .face-label { color: var(--gold); }
+.back .face-label { color: var(--red-soft); }
+.face-text { line-height: 1.7; color: rgba(245,234,214,0.92); }
+.front .face-text { font-size: clamp(1.05rem, 2.6vw, 1.3rem); font-style: italic; }
+.back .face-text { font-size: clamp(0.92rem, 2vw, 1.1rem); font-weight: 600; }
+.flip-hint { margin-top: 22px; font-size: 0.68rem; color: rgba(201,151,58,0.38); font-style: italic; }
+.nav { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+.btn { background: transparent; border: 1px solid var(--gold-dim); color: var(--gold); font-family: Georgia, serif; font-size: 1rem; padding: 10px 28px; border-radius: 50px; cursor: pointer; letter-spacing: 0.06em; transition: background 0.2s, box-shadow 0.2s, border-color 0.2s; }
+.btn:hover:not(:disabled) { background: rgba(201,151,58,0.1); border-color: var(--gold); box-shadow: 0 0 18px rgba(201,151,58,0.18); }
+.btn:disabled { opacity: 0.2; cursor: not-allowed; }
+.btn-secondary { border-color: rgba(139,26,26,0.45); color: var(--red-soft); font-size: 0.88rem; padding: 8px 22px; }
+.btn-secondary:hover:not(:disabled) { background: rgba(139,26,26,0.12); border-color: var(--red); box-shadow: none; }
+.btn-download { border-color: rgba(100,180,100,0.45); color: #90d090; font-size: 0.88rem; padding: 8px 22px; }
+.btn-download:hover { background: rgba(100,180,100,0.1); border-color: #90d090; box-shadow: none; }
+.ornament { color: rgba(201,151,58,0.28); font-size: 1rem; user-select: none; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+footer { margin-top: 32px; font-size: 0.65rem; color: rgba(245,234,214,0.15); letter-spacing: 0.12em; text-transform: uppercase; text-align: center; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<header>
+  <h1>⚔ История на България</h1>
+  <p class="subtitle">Флаш карти · Ранно Средновековие</p>
+  <div class="divider"></div>
+</header>
+
+<div class="progress-wrap">
+  <div class="progress-bar"><div class="progress-fill" id="fill" style="width: 20%;"></div></div>
+</div>
+<div class="counter" id="counter">Карта 6 от 30</div>
+
+<div class="scene" onclick="flip()">
+  <div class="card" id="card">
+    <div class="face front">
+      <div class="face-label">? &nbsp; Въпрос</div>
+      <div class="face-text" id="q">Кога и кой покръства България? Какво звание получава владетелят?</div>
+      <div class="flip-hint">-- кликнете, за да видите отговора --</div>
+    </div>
+    <div class="face back">
+      <div class="face-label">✓ &nbsp; Отговор</div>
+      <div class="face-text" id="a">864 г. - хан Борис е покръстен от византийски свещеници, приема името Михаил и титлата княз.</div>
+    </div>
+  </div>
+</div>
+
+<div class="nav">
+  <button class="btn" id="prev" onclick="go(-1)">← Назад</button>
+  <span class="ornament">✦</span>
+  <button class="btn" id="next" onclick="go(1)">Напред →</button>
+</div>
+
+<div class="actions">
+  <button class="btn btn-secondary" onclick="doShuffle()">⇄ Разбъркай</button>
+  <button class="btn btn-download" onclick="downloadFile()">⬇ Свали файла</button>
+</div>
+
+<footer>Аспарух · Тервел · Крум · Борис I · Кирил &amp; Методий · Симеон Велики</footer>
+
+<script>
+var ALL = [
+  { q: 'Кой е основателят на Първото българско царство и кога управлява?', a: 'Хан Аспарух - управлява от 681 г. до 701 г.' },
+  { q: 'В коя област се установяват Аспаруховите българи и защо?', a: 'В областта Онгъл - избрана стратегически заради защитеността и трудната достъпност.' },
+  { q: 'Как завършва военният конфликт между хан Аспарух и Византия (680 г.)?', a: 'Хан Аспарух разгромява византийската армия при Онгъла и преминава река Дунав на юг.' },
+  { q: 'Какво е значението на мирния договор от 681 г.?', a: 'Византийската империя официално признава съществуването на Българската държава.' },
+  { q: 'Коя е столицата на Аспаруховата България?', a: 'Плиска (Близка).' },
+  { q: 'Кои три етнически групи изграждат Аспаруховата държава?', a: 'Българи, Славяни и Потомци на траките.' },
+  { q: 'Кой е хан Тервел и кога управлява?', a: 'Синът на Аспарух; управлява от 701 г. до 721 г.' },
+  { q: 'На кой византийски император помага Тервел да си върне престола?', a: 'На Юстиниан II.' },
+  { q: 'Каква титла получава Тервел от Юстиниан II и какво означава тя?', a: 'Кесар - второто лице след византийския император.' },
+  { q: 'Коя област печели България като награда за помощта на Тервел?', a: 'Областта Загоре - на юг от Стара планина, свързваща Константинопол с Плиска.' },
+  { q: 'Защо хан Тервел е наречен Спасител на Европа?', a: 'През 718 г. българската войска разгромява арабската армия, обсадила Константинопол цяла година.' },
+  { q: 'Какъв паметник се смята, че хан Тервел е наредил да бъде изсечен?', a: 'Прочутият Мадарски конник (близо до гр. Шумен), символ на военния триумф.' },
+  { q: 'Кога хан Крум заема престола и как разширява България?', a: '803 г. - разширява на северозапад (отвъд Карпатите), на юг (р. Струма) и присъединява Сердика (дн. София).' },
+  { q: 'Какво се случва с византийския император Никифор I в България (811 г.)?', a: 'Никифор превзема и опожарява Плиска, но е разгромен и загива при Върбишкия проход.' },
+  { q: 'Кое е значението на Крумовите закони?', a: 'Първите писани закони - общи за българи и славяни; наказвали крадци, насилници и клеветници, подпомагали бедните.' },
+  { q: 'Какъв план има хан Крум след победата при Върбишкия проход?', a: 'Планирал да превземе Константинопол, но починал внезапно в разгара на подготовката.' },
+  { q: 'Кога и кой покръства България? Какво звание получава владетелят?', a: '864 г. - хан Борис е покръстен от византийски свещеници, приема името Михаил и титлата княз.' },
+  { q: 'Кога е създадена самостоятелната Българска църква?', a: '870 г. - след преговори на Борис I с Рим и Цариград.' },
+  { q: 'Защо Борис I настоява за собствена Българска църква?', a: 'Византийските свещеници служели на гръцки, непонятен за народа; независимата Църква укрепвала авторитета на България.' },
+  { q: 'Как приема Борис I учениците на Кирил и Методий?', a: '886 г. - приема ги с уважение и им дава всичко необходимо да продължат делото си.' },
+  { q: 'Кога и кои братя създават славянската азбука?', a: '855 г. - Кирил и Методий, родени в Солун.' },
+  { q: 'Как се казва азбуката на Кирил и Методий и коя я наследява?', a: 'Глаголица - по-късно преработена от български книжовници в кирилица.' },
+  { q: 'Кой е Климент Охридски и с какво е известен?', a: 'Първият български учител и писател; обучавал ученици в Охрид. Носи името му Софийският университет.' },
+  { q: 'Кой основава Преславската книжовна школа?', a: 'Наум Преславско-Охридски - останал да работи в столицата Плиска.' },
+  { q: 'Какво значение има делото на Кирил и Методий за единството на България?', a: 'Проповедта на роден език заличила различията между българи и славяни - образувала се единна общност с името българи.' },
+  { q: 'Как се казва новата столица на Симеон и с какво се прославя?', a: 'Велики Преслав - съперничела по красота и богатство с Константинопол.' },
+  { q: 'Каква титла признава Византия на цар Симеон?', a: 'Цар - равнозначно на император.' },
+  { q: 'Какво постига Симеон при битката при р. Ахелой (917 г.)?', a: 'Разгромява почти цялата византийска армия; границите достигат до Черно, Егейско и Адриатическо море.' },
+  { q: 'Защо управлението на Симеон се нарича Златен век?', a: 'Заради огромното териториално разширение и небивалия разцвет на книжнината и културата.' },
+  { q: 'Кои са известните книжовници от епохата на Симеон?', a: 'Константин Преславски (стихове), Йоан Екзарх (описание на двореца), Черноризец Храбър (За буквите).' }
+];
+
+var cards = ALL.slice(), idx = 0, isFlipped = false;
+
+function render() {
+  var c = cards[idx];
+  document.getElementById('q').textContent = c.q;
+  document.getElementById('a').textContent = c.a;
+  document.getElementById('counter').textContent = 'Карта ' + (idx + 1) + ' от ' + cards.length;
+  document.getElementById('fill').style.width = ((idx + 1) / cards.length * 100) + '%';
+  document.getElementById('prev').disabled = idx === 0;
+  document.getElementById('next').disabled = idx === cards.length - 1;
+  isFlipped = false;
+  document.getElementById('card').classList.remove('flipped');
+}
+
+function flip() {
+  isFlipped = !isFlipped;
+  document.getElementById('card').classList.toggle('flipped', isFlipped);
+}
+
+function go(d) {
+  var n = idx + d;
+  if (n >= 0 && n < cards.length) { idx = n; render(); }
+}
+
+function doShuffle() {
+  cards = ALL.slice();
+  for (var i = cards.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var t = cards[i]; cards[i] = cards[j]; cards[j] = t;
+  }
+  idx = 0; render();
+}
+
+function downloadFile() {
+  var html = document.documentElement.outerHTML;
+  var blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'flashcards-bulgaria.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'ArrowRight') go(1);
+  else if (e.key === 'ArrowLeft') go(-1);
+  else if (e.key === ' ') { e.preventDefault(); flip(); }
+});
+
+render();
+</script>
+
+
+</body></html>
